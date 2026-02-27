@@ -2,20 +2,10 @@ from collections import defaultdict
 from typing import BinaryIO
 from multiprocessing import Pool, cpu_count
 import regex as re
-import os, heapq, pickle
+import os
 
 GPT2_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-class ReversedPair:
-    def __init__(self, pair):
-        self.pair = pair
-
-    def __lt__(self, other):
-        return self.pair > other.pair
-    
-    def __eq__(self, other):
-        return self.pair == other.pair
-    
 def find_chunk_boundaries(
     file: BinaryIO,
     num_chunks: int,
@@ -121,10 +111,9 @@ def run_train_bpe(
     # imap_unordered does not out a full chunk like map does, it yield chunks every iteration
     with Pool(num_processes) as pool:
         chunks = pool.imap_unordered(process_chunk, chunk_args)
-        for i, chunk in enumerate(chunks):
+        for chunk in chunks:
             for k, v in chunk.items():
                 words[k] = words.get(k, 0) + v
-            print(f"[BPE] Merged chunk {i+1}/{len(chunk_args)}", flush=True)
 
     # init pairs to word, optimize finding if word have best pair
     pair_to_words : dict[tuple[bytes, bytes], set[tuple[bytes]]] = defaultdict(set)
@@ -136,7 +125,6 @@ def run_train_bpe(
     vocab = vocab_init(special_tokens)
 
     num_merges = vocab_size - len(vocab)
-    print(f"[BPE] Word vocab size: {len(words)}, starting {num_merges} merges...")
     merges = []
 
     # init pair-and-freq
@@ -146,39 +134,18 @@ def run_train_bpe(
             pair = (word[i], word[i+1])
             pair_freq[pair] += freq
     
-    # max-freq and greater-lexicography heap
-    heap = [(-freq, ReversedPair(pair)) for pair, freq in pair_freq.items() if freq > 0]
-    heapq.heapify(heap) 
-
-    for merge_idx in range(num_merges):
-
+    for _ in range(num_merges):    
         if not pair_freq:
             break
 
-        # remove merged redundant elements
-        best_pair = None
-        while heap:
-            neg_freq, reversedpair = heapq.heappop(heap)
-            if pair_freq.get(reversedpair.pair, 0) == -neg_freq:
-                best_pair = reversedpair.pair
-                break
-        
-        if best_pair is None:
-            break
-
+        best_pair = max(pair_freq, key= lambda p: (pair_freq[p], p))
         merges.append(best_pair)
         new_token = best_pair[0] + best_pair[1]
         vocab[len(vocab)] = new_token
 
-        # Snapshot before any mutations — new_word may re-enter pair_to_words[best_pair]
-        # mid-loop if it still contains best_pair, causing double-processing.
         affected_words = list(pair_to_words[best_pair[0], best_pair[1]])
 
-        delta: dict[tuple[bytes, bytes], int] = defaultdict(int)
-
         for word in affected_words:
-            if word not in words:
-                continue
             """
             for each affected word - word containing the best pair,
             merge the best pair into a new word
@@ -201,77 +168,46 @@ def run_train_bpe(
 
             # edit the words directly, remove old word pairs, add new's 
             new_word = tuple(new_word)
-
-            # If new_word already exists, undo its pair contributions before merging
-            existing_freq = words.get(new_word, 0)
-            if existing_freq > 0:
-                for i in range(len(new_word) - 1):
-                    p = (new_word[i], new_word[i+1])
-                    delta[p] -= existing_freq
-                    # pair_freq[p] -= existing_freq
-                    pair_to_words[p].discard(new_word)
-
             del words[word]
-            words[new_word] = existing_freq + freq
+            words[new_word] = freq
 
             for i in range(len(word)-1):
-                p = (word[i], word[i+1])
-                pair_to_words[p].discard(word)
-                if not pair_to_words[p]:
-                    del pair_to_words[p]
-                delta[p] -= freq
+                pair_to_words[word[i], word[i+1]].discard(word)
 
             for i in range(len(new_word)-1):
-                p = (new_word[i], new_word[i+1])
-                pair_to_words[p].add(new_word)
-                delta[p] += existing_freq + freq
+                pair_to_words[new_word[i], new_word[i+1]].add(new_word)
 
-        for p, d in delta.items():
-            if d == 0:
-                continue
-            pair_freq[p] += d
-            if pair_freq[p] > 0:
-                heapq.heappush(heap, (-pair_freq[p], ReversedPair(p)))
-            elif pair_freq[p] == 0:
-                del pair_freq[p]
+            for j, token in enumerate(new_word):
+                """
+                (x h e l l o) -> (x he l l o)
+                remove (x,h) (e,l) (he) 
+                add (x,he) (he,l) 
+                """
+                if token!=new_token:
+                    continue
 
-        if (merge_idx+1) % 1000 == 0 or merge_idx == num_merges - 1:
-            # print(f"[BPE] Merge {merge_idx+1}/{num_merges}: {best_pair}, freq={best_freq}", flush=True)
-            print(f"[BPE] Merge {merge_idx+1}/{num_merges}", flush=True)
+                pair_freq[best_pair] -=freq
+
+                if j > 0: # have left neighbor
+                    old_left = best_pair[1] if new_word[j-1]==new_token else new_word[j-1]
+                    pair_freq[old_left, best_pair[0]] -= freq
+                    pair_freq[new_word[j-1], new_token] += freq
+                    
+                if j < len(new_word)-1 and new_word[j+1]!=new_token: # have right neighbor
+                    pair_freq[best_pair[1], new_word[j+1]] -= freq
+                    pair_freq[new_token, new_word[j+1]] += freq
+
+        pair_freq = defaultdict(int, {p: f for p, f in pair_freq.items() if f > 0})
 
     return vocab, merges
 
-def save_bpe_model(
-        output_path: str|os.PathLike,
-        vocab: dict[int, bytes],
-        merge: list[tuple[bytes, bytes]],
-        **kwargs,
-):
-    os.makedirs(output_path, exist_ok=True)
-    file_name = "vocab.pkl"
-    file_path = os.path.join(output_path, file_name)
-    with open(file_path, "wb") as f:
-        pickle.dump(vocab, f)
+def main():
+    vocab, merge = run_train_bpe(
+        input_path="/Users/ryanli/Documents/repos/assignment1-basics/cs336_basics/data/TinyStoriesV2-GPT4-valid.txt",
+        vocab_size=10000,
+        special_tokens=["<|endoftext|>"],
+        num_processes=10,
+    )
 
-    file_name = "merge.pkl"
-    file_path = os.path.join(output_path, file_name)
-    with open(file_path, "wb") as f:
-        pickle.dump(merge, f)
-    
-def load_bpe_model(
-        input_path: str|os.PathLike,
-        **kwargs,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    
-    file_name = "vocab.pkl"
-    file_path = os.path.join(input_path, file_name)
-    with open(file_path, "rb") as f:
-        vocab = pickle.load(f)
-
-    file_name = "merge.pkl"
-    file_path = os.path.join(input_path, file_name)
-    with open(file_path, "rb") as f:
-        merge = pickle.load(f)
-    
-    return vocab, merge
-    
+if __name__ == '__main__':
+    main()

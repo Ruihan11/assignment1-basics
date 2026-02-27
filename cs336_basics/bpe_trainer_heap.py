@@ -120,11 +120,11 @@ def run_train_bpe(
 
     # imap_unordered does not out a full chunk like map does, it yield chunks every iteration
     with Pool(num_processes) as pool:
-        chunks = pool.imap_unordered(process_chunk, chunk_args)
-        for i, chunk in enumerate(chunks):
-            for k, v in chunk.items():
-                words[k] = words.get(k, 0) + v
-            print(f"[BPE] Merged chunk {i+1}/{len(chunk_args)}", flush=True)
+        results = pool.map(process_chunk, chunk_args)
+    for i, chunk in enumerate(results):
+        for k, v in chunk.items():
+            words[k] = words.get(k, 0) + v
+        print(f"[BPE] Merged chunk {i+1}/{len(chunk_args)}", flush=True)
 
     # init pairs to word, optimize finding if word have best pair
     pair_to_words : dict[tuple[bytes, bytes], set[tuple[bytes]]] = defaultdict(set)
@@ -274,4 +274,17 @@ def load_bpe_model(
         merge = pickle.load(f)
     
     return vocab, merge
-    
+
+def main():
+    vocab, merge = run_train_bpe(
+        input_path="cs336_basics/data/owt_train.txt",
+        # input_path="cs336_basics/data/TinyStoriesV2-GPT4-train.txt",
+        vocab_size=32000,
+        special_tokens=["<|endoftext|>"],
+        num_processes=4,
+    )
+
+    save_bpe_model("cs336_basics/output/", vocab, merge)
+
+if __name__ == '__main__':
+    main()
